@@ -1,65 +1,381 @@
-import Image from "next/image";
+'use client';
 
-export default function Home() {
+import { useState, useEffect, useRef, useCallback } from 'react';
+import { LineChart, Line, YAxis, ResponsiveContainer } from 'recharts';
+import ChestScene from './ChestModel';
+
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE_PATH || 'http://localhost:8000';
+const DEVICE_ID = process.env.NEXT_PUBLIC_DEVICE_ID || 'test-device-001';
+
+// --- Component 1: Live Signal Chart ---
+export function LiveSignalChart() {
+  const [data, setData] = useState(Array.from({ length: 50 }, (_, i) => ({ time: i, value: 0 })));
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setData(prevData => {
+        const newData = [...prevData.slice(1)];
+        const isKnock = Math.random() > 0.95; 
+        const value = isKnock ? 80 + Math.random() * 20 : Math.random() * 5;
+        newData.push({ time: prevData[prevData.length - 1].time + 1, value });
+        return newData;
+      });
+    }, 100); 
+    return () => clearInterval(interval);
+  }, []);
+
   return (
-    <div className="flex min-h-screen items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex min-h-screen w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
+    <ResponsiveContainer width="100%" height="100%">
+      <LineChart data={data}>
+        <YAxis domain={[-10, 110]} hide />
+        <Line type="monotone" dataKey="value" stroke="#3b82f6" strokeWidth={2} dot={false} isAnimationActive={false} />
+      </LineChart>
+    </ResponsiveContainer>
+  );
+}
+
+// --- Component 2: Recorded Pattern Chart (Web Audio API) ---
+export function RecordedPatternChart({ isRecording }: { isRecording: boolean }) {
+  const [audioData, setAudioData] = useState<{ time: number; value: number }[]>(
+    Array.from({ length: 100 }, (_, i) => ({ time: i, value: 128 }))
+  );
+  
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const requestRef = useRef<number>(0); // <-- FIXED TYPE ERROR HERE
+
+  useEffect(() => {
+    if (isRecording) {
+      const startMicrophone = async () => {
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          streamRef.current = stream;
+
+          const AudioContext = window.AudioContext || (window as any).webkitAudioContext;
+          const audioCtx = new AudioContext();
+          audioContextRef.current = audioCtx;
+
+          const analyser = audioCtx.createAnalyser();
+          analyser.fftSize = 256; 
+
+          const source = audioCtx.createMediaStreamSource(stream);
+          source.connect(analyser);
+
+          const dataArray = new Uint8Array(analyser.frequencyBinCount);
+
+          const updateChart = () => {
+            analyser.getByteTimeDomainData(dataArray);
+            const newChartData = Array.from(dataArray).slice(0, 100).map((val, i) => ({ time: i, value: val }));
+            setAudioData(newChartData);
+            requestRef.current = requestAnimationFrame(updateChart);
+          };
+
+          updateChart();
+        } catch (err) {
+          console.error("Microphone access denied:", err);
+        }
+      };
+      startMicrophone();
+    } else {
+      if (requestRef.current) cancelAnimationFrame(requestRef.current);
+      if (streamRef.current) streamRef.current.getTracks().forEach(track => track.stop());
+      if (audioContextRef.current && audioContextRef.current.state !== 'closed') audioContextRef.current.close();
+      setAudioData(Array.from({ length: 100 }, (_, i) => ({ time: i, value: 128 })));
+    }
+
+    return () => {
+      if (requestRef.current) cancelAnimationFrame(requestRef.current);
+      if (streamRef.current) streamRef.current.getTracks().forEach(track => track.stop());
+      if (audioContextRef.current && audioContextRef.current.state !== 'closed') audioContextRef.current.close();
+    };
+  }, [isRecording]);
+
+  return (
+    <ResponsiveContainer width="100%" height="100%">
+      <LineChart data={audioData}>
+        <YAxis domain={[0, 255]} hide />
+        <Line type="monotone" dataKey="value" stroke={isRecording ? "#ef4444" : "#10b981"} strokeWidth={2} dot={false} isAnimationActive={false} />
+      </LineChart>
+    </ResponsiveContainer>
+  );
+}
+
+// --- Main Dashboard Component ---
+export default function Dashboard() {
+  const [sensitivity, setSensitivity] = useState<number>(0.0);
+  const [rmseThreshold, setRmseThreshold] = useState<number>(0);
+  const [events, setEvents] = useState<any[]>([]);
+  const [isRecording, setIsRecording] = useState(false);
+  const [loadingConfig, setLoadingConfig] = useState(true);
+  const [deviceState, setDeviceState] = useState<any>(null);
+  const [isLocked, setIsLocked] = useState<boolean>(true);
+
+  const fetchConfig = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/devices/${DEVICE_ID}/config`);
+      const data = await res.json();
+      if (data && data.data) {
+        setSensitivity((data.data.activation_threshold || 0) / 1024);
+        setRmseThreshold(data.data.predict_threshold || 0);
+      }
+    } catch (error) {
+      console.error("Failed to fetch config:", error);
+    } finally {
+      setLoadingConfig(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchConfig();
+  }, [fetchConfig]);
+
+  const updateConfig = async () => {
+    const payload = {
+      rev: 1,
+      data: { activation_threshold: Math.round(sensitivity * 1024), predict_threshold: rmseThreshold }
+    };
+    try {
+      await fetch(`${API_BASE}/api/v1/devices/${DEVICE_ID}/config`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      alert('Configuration pushed to device.');
+    } catch (error) {
+      console.error("Failed to update config:", error);
+    }
+  };
+
+  useEffect(() => {
+    const pollData = async () => {
+      try {
+        const eventsRes = await fetch(`${API_BASE}/api/v1/devices/${DEVICE_ID}/events/latest?limit=10`);
+        const eventsData = await eventsRes.json();
+        if (eventsData && eventsData.items) {
+          setEvents(eventsData.items);
+        }
+
+        const stateRes = await fetch(`${API_BASE}/api/v1/devices/${DEVICE_ID}/state`);
+        if (stateRes.ok) {
+          const stateData = await stateRes.json();
+          setDeviceState(stateData);
+        }
+      } catch (error) {
+        console.error("Polling failed:", error);
+      }
+    };
+
+    const intervalId = setInterval(pollData, 2000);
+    return () => clearInterval(intervalId);
+  }, []);
+
+  const handleLockAction = async (action: 'lock' | 'unlock') => {
+    try {
+      await fetch(`${API_BASE}/api/v1/devices/${DEVICE_ID}/actions/${action}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: action === 'unlock' ? JSON.stringify({ durationMs: 5000 }) : undefined
+      });
+      setIsLocked(action === 'lock');
+    } catch (error) {
+      console.error(`Failed to ${action}:`, error);
+    }
+  };
+
+  const handleMicToggle = async () => {
+    try {
+      if (!isRecording) {
+        await fetch(`${API_BASE}/api/v1/devices/${DEVICE_ID}/actions/learn/start`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sessionName: "new-pattern", maxDurationMs: 10000 })
+        });
+        setIsRecording(true);
+      } else {
+        await fetch(`${API_BASE}/api/v1/devices/${DEVICE_ID}/actions/learn/stop`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ saveAsPattern: true, patternName: "new-pattern" })
+        });
+        setIsRecording(false);
+      }
+    } catch (error) {
+      console.error("Failed to toggle mic state:", error);
+    }
+  };
+
+  const handleCancelPattern = async () => {
+    try {
+      await fetch(`${API_BASE}/api/v1/devices/${DEVICE_ID}/actions/learn/stop`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ saveAsPattern: false })
+      });
+      setIsRecording(false);
+    } catch (error) {
+      console.error("Failed to cancel pattern:", error);
+    }
+  };
+
+  return (
+    <div className={`min-h-screen w-full flex overflow-hidden bg-gradient-to-tr text-white p-6 transition-colors duration-1000 ease-in-out ${
+      isLocked ? 'from-red-950 via-neutral-900 to-black' : 'from-green-950 via-neutral-900 to-black'
+    }`}>
+      
+      {/* 3D Chest Scene */}
+      <ChestScene isLocked={isLocked} />
+
+      {/* Background Element for Chest Animation Indicator */}
+      <div className="absolute top-0 right-0 bottom-0 w-2/3 pointer-events-none flex items-center justify-center opacity-10 z-0 overflow-hidden">
+         <h1 className="text-[8vw] xl:text-[10vw] font-bold tracking-widest uppercase text-center select-none whitespace-nowrap">
+            {isLocked ? 'LOCKED' : 'UNLOCKED'}
+         </h1>
+      </div>
+
+      {/* Left Column */}
+      <div className="w-1/3 flex flex-col gap-6 pr-6 border-r border-neutral-700 z-10">
+        
+        {/* Device State */}
+        <div className="bg-neutral-800 p-4 rounded-lg shadow-lg border border-neutral-700">
+          <div className="flex justify-between items-center mb-4">
+            <h2 className="text-xl font-bold">Device State</h2>
+            <span className={`px-2 py-1 rounded text-xs font-bold ${deviceState?.status === 'online' ? 'bg-green-600' : 'bg-red-600'}`}>
+              {deviceState?.status?.toUpperCase() || 'OFFLINE'}
+            </span>
+          </div>
+          <div className="flex gap-4 text-sm text-neutral-400 mb-4">
+            <div>Battery: <span className="text-white">{deviceState?.telemetry?.battery || '--'}%</span></div>
+            <div>RSSI: <span className="text-white">{deviceState?.telemetry?.rssi || '--'} dBm</span></div>
+          </div>
+          <div className="flex gap-2">
+            <button onClick={() => handleLockAction('lock')} className="flex-1 bg-red-900 hover:bg-red-800 py-2 rounded font-semibold transition-colors">Lock</button>
+            <button onClick={() => handleLockAction('unlock')} className="flex-1 bg-green-900 hover:bg-green-800 py-2 rounded font-semibold transition-colors">Unlock</button>
+          </div>
         </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
+
+        {/* Threshold Panel */}
+        <div className="bg-neutral-800 p-4 rounded-lg shadow-lg border border-neutral-700">
+          <h2 className="text-xl font-bold mb-4">Threshold Config</h2>
+          {loadingConfig ? <p className="text-neutral-400">Fetching state...</p> : (
+            <div className="space-y-4">
+              <div>
+                <label className="flex justify-between text-sm mb-1">
+                  <span>Sensitivity</span>
+                  <span>{sensitivity.toFixed(1)} / 1.0</span>
+                </label>
+                <input 
+                  type="range" min="0" max="1" step="0.1" 
+                  value={sensitivity} 
+                  onChange={(e) => setSensitivity(parseFloat(e.target.value))}
+                  className="w-full accent-blue-500"
+                />
+              </div>
+              <div>
+                <label className="flex justify-between text-sm mb-1">
+                  <span>RMSE Threshold</span>
+                  <span>{rmseThreshold} / 1500</span>
+                </label>
+                <input 
+                  type="range" min="0" max="1500" step="10" 
+                  value={rmseThreshold} 
+                  onChange={(e) => setRmseThreshold(parseInt(e.target.value))}
+                  className="w-full accent-blue-500"
+                />
+              </div>
+              <button 
+                onClick={updateConfig}
+                className="w-full bg-blue-600 hover:bg-blue-500 py-2 rounded font-semibold transition-colors">
+                Update & Push to Device
+              </button>
+            </div>
+          )}
         </div>
-      </main>
+
+        {/* Live Line Chart */}
+        <div className="bg-neutral-800 flex-1 p-4 rounded-lg shadow-lg border border-neutral-700 flex flex-col min-h-[250px]">
+           <h3 className="text-sm text-neutral-400 mb-2">Live Line chart for the live signal</h3>
+           <div className="relative w-full h-full min-h-[200px] bg-neutral-900 rounded overflow-hidden">
+              <LiveSignalChart />
+           </div>
+        </div>
+
+        {/* System Log */}
+        <div className="bg-neutral-800 h-64 p-4 rounded-lg shadow-lg border border-neutral-700 flex flex-col">
+          <h3 className="text-sm text-neutral-400 mb-2">Access Log</h3>
+          <div className="flex-1 overflow-y-auto space-y-2 pr-2">
+            {events.length === 0 ? (
+              <p className="text-neutral-500 text-sm">No events recorded.</p>
+            ) : (
+              events.map((ev, idx) => {
+                const isKnock = ev.type === 'knock_result';
+                const passed = ev.matched === true;
+                const rawTs = ev.ts || ev.serverReceivedTs; 
+                const timeString = rawTs ? new Date(rawTs).toLocaleTimeString() : 'Unknown time';
+
+                let contentDetails = '';
+                if (isKnock) {
+                  const score = ev.score ?? ev.payload?.data?.score ?? 'N/A';
+                  const pattern = ev.pattern || ev.payload?.data?.patternId || 'Unknown';
+                  contentDetails = `Score: ${score} | Pattern: ${pattern}`;
+                } else if (ev.payload?.data && typeof ev.payload.data === 'object') {
+                  contentDetails = Object.entries(ev.payload.data)
+                    .map(([k, v]) => `${k}: ${typeof v === 'object' ? JSON.stringify(v) : v}`)
+                    .join(', ');
+                } else {
+                  contentDetails = 'No additional data';
+                }
+
+                return (
+                  <div key={idx} className={`bg-neutral-700 p-2 rounded text-sm flex flex-col gap-1 border-l-4 ${isKnock ? (passed ? 'border-green-500' : 'border-red-500') : 'border-blue-500'}`}>
+                    <div className="flex justify-between items-center">
+                      {isKnock ? (
+                        <span className={`font-bold ${passed ? 'text-green-400' : 'text-red-400'}`}>
+                          {passed ? 'Passed (Knock)' : 'Failed (Knock)'}
+                        </span>
+                      ) : (
+                        <span className="text-blue-300 font-bold capitalize">{ev.type?.replace('_', ' ')}</span>
+                      )}
+                      <span className="text-neutral-400 text-xs font-mono">{timeString}</span>
+                    </div>
+                    <div className="text-neutral-300 text-xs truncate" title={contentDetails}>
+                      {contentDetails}
+                    </div>
+                  </div>
+                )
+              })
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Right Column */}
+      <div className="w-2/3 flex flex-col justify-end items-end pl-6 pb-6 z-10">
+        <div className="w-full max-w-2xl bg-neutral-800 p-4 rounded-lg shadow-lg border border-neutral-700 flex flex-col gap-4 relative">
+          <h3 className="text-sm text-neutral-400">Live line chart of the recorded knocking pattern</h3>
+          
+          <div className="h-48 w-full border border-neutral-600 border-dashed rounded bg-neutral-900 overflow-hidden">
+            <RecordedPatternChart isRecording={isRecording} />
+          </div>
+
+          <div className="flex justify-between items-center mt-2">
+            <div className="text-xs text-neutral-400">
+              {isRecording && <span className="text-red-400 animate-pulse">● Recording active...</span>}
+            </div>
+            <div className="flex gap-4">
+              {isRecording && (
+                <button onClick={handleCancelPattern} className="bg-neutral-600 hover:bg-neutral-500 px-4 py-2 rounded font-semibold transition-colors text-sm">
+                  Cancel
+                </button>
+              )}
+              <button onClick={handleMicToggle} className={`rounded-full w-16 h-16 flex items-center justify-center font-bold text-lg shadow-lg transition-all transform hover:scale-105 ${
+                  isRecording ? 'bg-red-600 animate-pulse ring-4 ring-red-900' : 'bg-blue-600 hover:bg-blue-500'
+                }`}>
+                {isRecording ? 'END' : 'MIC'}
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
   );
 }

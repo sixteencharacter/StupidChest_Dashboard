@@ -1,0 +1,13 @@
+services:
+  dashboard:
+    build:
+      context: .
+      args:
+        NEXT_PUBLIC_API_BASE_PATH: http://localhost:8000
+        NEXT_PUBLIC_DEVICE_ID: test-device-001
+    container_name: knocklock-dashboard
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+    restart: unless-stopped
