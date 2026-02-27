@@ -190,10 +190,10 @@ export default function Dashboard() {
               <div>
                 <label className="flex justify-between text-sm mb-1">
                   <span>Sensitivity</span>
-                  <span>{sensitivity.toFixed(1)} / 1.0</span>
+                  <span>{sensitivity.toFixed(2)} / 1.0</span>
                 </label>
                 <input
-                  type="range" min="0" max="1" step="0.1"
+                  type="range" min="0" max="1" step="0.01"
                   value={sensitivity}
                   onChange={(e) => setSensitivity(parseFloat(e.target.value))}
                   className="w-full accent-blue-500"
@@ -239,6 +239,7 @@ export default function Dashboard() {
                 const isKnock = ev.type === 'knock_result';
                 const passed = ev.matched === true;
                 const rawTs = ev.ts || ev.serverReceivedTs;
+                const isautoClosed = ev.payload.meta.schema_ == "knock_result/v1-e"
                 const timeString = rawTs ? new Date(rawTs).toLocaleTimeString() : 'Unknown time';
 
                 let contentDetails = '';
@@ -259,7 +260,9 @@ export default function Dashboard() {
                     <div className="flex justify-between items-center">
                       {isKnock ? (
                         <span className={`font-bold ${passed ? 'text-green-400' : 'text-red-400'}`}>
-                          {passed ? 'Passed (Knock)' : 'Failed (Knock)'}
+                          {isautoClosed ? 'Autoclosed' : `
+                            ${passed ? 'Passed (Knock)' : 'Failed (Knock)'}
+                          `}
                         </span>
                       ) : (
                         <span className="text-blue-300 font-bold capitalize">{ev.type?.replace('_', ' ')}</span>
