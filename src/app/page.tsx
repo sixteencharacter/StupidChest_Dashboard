@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 
 import ChestScene from '@/components/ChestModel';
 import LiveSignalChart from '@/components/LiveSignalChart'
@@ -114,7 +114,7 @@ export default function Dashboard() {
       data: {
         activation_threshold: Math.round(sensitivity * 1024),
         predict_threshold: rmseThreshold,
-        pattern_representation: patternRep,
+        pattern_representation: pattern,
         idle_cutoff_period: idleCutoffPeriod
       }
     };
@@ -123,13 +123,13 @@ export default function Dashboard() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     });
+    setPattern(undefined)
     alert('Configuration pushed to device.');
     setPatternPanelState("DEFAULT")
   }
 
   const handleCancelPattern = async () => {
     try {
-      setIsRecording(false);
       setIsProcessing(false)
       setPatternPanelState("DEFAULT")
     } catch (error) {
@@ -293,7 +293,7 @@ export default function Dashboard() {
             <div className="flex gap-4">
               {patternPanelState == "END" && (
                 <>
-                  {isProcessing ? (
+                  {isProcessing && pattern !== undefined ? (
                     <p>Loading...</p>
                   ) : (
                     <>
