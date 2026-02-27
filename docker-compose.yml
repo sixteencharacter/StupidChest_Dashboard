@@ -7,7 +7,7 @@ services:
         NEXT_PUBLIC_DEVICE_ID: test-device-001
     container_name: knocklock-dashboard
     ports:
-      - "3000:3000"
+      - "3001:3000"
     environment:
       - NODE_ENV=production
     restart: unless-stopped
