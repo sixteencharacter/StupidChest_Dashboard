@@ -60,7 +60,7 @@ function Chest({ isLocked }: { isLocked: boolean }) {
 export default function ChestScene({ isLocked }: { isLocked: boolean }) {
   return (
     // 1. Removed mix-blend-screen and bumped opacity up to 80% (or remove opacity-80 entirely for max brightness)
-    <div className="absolute inset-0 pointer-events-none z-0 opacity-80">
+    <div className="absolute left-140 top-[-50] inset-0 pointer-events-none z-0 opacity-80">
       <Canvas camera={{ position: [4, 3, 5], fov: 45 }}>
         <ambientLight intensity={1.5} />
         <directionalLight position={[5, 10, 5]} intensity={2.5} />

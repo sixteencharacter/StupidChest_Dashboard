@@ -10,18 +10,17 @@ const DEVICE_ID = process.env.NEXT_PUBLIC_DEVICE_ID || 'test-device-001';
 // --- Component 1: Live Signal Chart ---
 export function LiveSignalChart() {
   const [data, setData] = useState(Array.from({ length: 50 }, (_, i) => ({ time: i, value: 0 })));
-
   useEffect(() => {
-    const interval = setInterval(() => {
-      setData(prevData => {
+    let ws = new WebSocket(`${API_BASE}/api/v1/devices/knockbox-v1-001/events/live`)
+
+    if(ws) {
+      ws.onmessage = (event : MessageEvent<any>) => {
+        setData(prevData => {
         const newData = [...prevData.slice(1)];
-        const isKnock = Math.random() > 0.95; 
-        const value = isKnock ? 80 + Math.random() * 20 : Math.random() * 5;
+        const value = Number(event.data)
         newData.push({ time: prevData[prevData.length - 1].time + 1, value });
         return newData;
-      });
-    }, 100); 
-    return () => clearInterval(interval);
+    })}}
   }, []);
 
   return (
@@ -35,12 +34,14 @@ export function LiveSignalChart() {
 }
 
 // --- Component 2: Recorded Pattern Chart (Web Audio API) ---
-export function RecordedPatternChart({ isRecording }: { isRecording: boolean }) {
+export function RecordedPatternChart({ isRecording , callback }: { isRecording: boolean , callback : (a : any) => void }) {
   const [audioData, setAudioData] = useState<{ time: number; value: number }[]>(
     Array.from({ length: 100 }, (_, i) => ({ time: i, value: 128 }))
   );
   
   const audioContextRef = useRef<AudioContext | null>(null);
+  const audioChunkRef = useRef<any[]>([])
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const requestRef = useRef<number>(0); // <-- FIXED TYPE ERROR HERE
 
@@ -49,6 +50,27 @@ export function RecordedPatternChart({ isRecording }: { isRecording: boolean }) 
       const startMicrophone = async () => {
         try {
           const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          const recorder = new MediaRecorder(stream);
+          mediaRecorderRef.current = recorder;
+          if(mediaRecorderRef.current) {
+            mediaRecorderRef.current.start()
+            mediaRecorderRef.current.ondataavailable = (event) => {
+              if (event.data.size > 0) {
+                audioChunkRef.current.push(event.data);
+              }
+            }
+            mediaRecorderRef.current.onstop = () => {
+              const audioBlob = new Blob(audioChunkRef.current, {type : 'audio/webm'})
+              const fd = new FormData();
+              fd.set("audio_sample",audioBlob as Blob,"audio_sample.webm")
+              fetch(`${API_BASE}/api/v1/patterns/transcription`,{
+                method : "POST",
+                body : fd
+              }).then(async (res)=>{
+                callback(await res.json())
+              })
+            }
+          }
           streamRef.current = stream;
 
           const AudioContext = window.AudioContext || (window as any).webkitAudioContext;
@@ -81,6 +103,10 @@ export function RecordedPatternChart({ isRecording }: { isRecording: boolean }) 
       if (streamRef.current) streamRef.current.getTracks().forEach(track => track.stop());
       if (audioContextRef.current && audioContextRef.current.state !== 'closed') audioContextRef.current.close();
       setAudioData(Array.from({ length: 100 }, (_, i) => ({ time: i, value: 128 })));
+      if(mediaRecorderRef.current) {
+        mediaRecorderRef.current.stop();
+      }
+      audioChunkRef.current = [];
     }
 
     return () => {
@@ -104,19 +130,26 @@ export function RecordedPatternChart({ isRecording }: { isRecording: boolean }) 
 export default function Dashboard() {
   const [sensitivity, setSensitivity] = useState<number>(0.0);
   const [rmseThreshold, setRmseThreshold] = useState<number>(0);
+  const [idleCutoffPeriod , setIdleCutoffPeriod] = useState<number>(0);
+  const [patternRep , setPatternRep] = useState<Array<number>>([])
   const [events, setEvents] = useState<any[]>([]);
   const [isRecording, setIsRecording] = useState(false);
   const [loadingConfig, setLoadingConfig] = useState(true);
   const [deviceState, setDeviceState] = useState<any>(null);
   const [isLocked, setIsLocked] = useState<boolean>(true);
+  const [patternPanelState,setPatternPanelState] = useState<"DEFAULT"|"RECORD"|"END">("DEFAULT")
+  const [pattern,setPattern] = useState<any[]>();
+  const [isProcessing,setIsProcessing] = useState<boolean>(false);
 
   const fetchConfig = useCallback(async () => {
     try {
       const res = await fetch(`${API_BASE}/api/v1/devices/${DEVICE_ID}/config`);
       const data = await res.json();
-      if (data && data.data) {
-        setSensitivity((data.data.activation_threshold || 0) / 1024);
-        setRmseThreshold(data.data.predict_threshold || 0);
+      if (data && data.desired.data) {
+        setSensitivity((data.desired.data.activation_threshold || 0) / 1024);
+        setRmseThreshold(data.desired.data.predict_threshold || 0);
+        setIdleCutoffPeriod(data.desired.data.idle_cutoff_period || 0);
+        setPatternRep(data.desired.data.pattern_representation || []);
       }
     } catch (error) {
       console.error("Failed to fetch config:", error);
@@ -132,7 +165,12 @@ export default function Dashboard() {
   const updateConfig = async () => {
     const payload = {
       rev: 1,
-      data: { activation_threshold: Math.round(sensitivity * 1024), predict_threshold: rmseThreshold }
+      data: { 
+        activation_threshold: Math.round(sensitivity * 1024), 
+        predict_threshold: rmseThreshold,
+        pattern_representation : patternRep,
+        idle_cutoff_period : idleCutoffPeriod
+      }
     };
     try {
       await fetch(`${API_BASE}/api/v1/devices/${DEVICE_ID}/config`, {
@@ -155,13 +193,16 @@ export default function Dashboard() {
           setEvents(eventsData.items);
         }
 
-        const stateRes = await fetch(`${API_BASE}/api/v1/devices/${DEVICE_ID}/state`);
-        if (stateRes.ok) {
-          const stateData = await stateRes.json();
-          setDeviceState(stateData);
-        }
+        const devStateRes = await fetch(`${API_BASE}/api/v1/stats/${DEVICE_ID}/snapshot`);
+        const devStateData = await devStateRes.json();
+        if (devStateData && devStateData.lastKnockResult && devStateData.lastKnockResult.matched) {
+          setIsLocked(false);
+        } else setIsLocked(true);
+
+        setDeviceState({status : "online"})
       } catch (error) {
         console.error("Polling failed:", error);
+        setDeviceState({status : "offline"})
       }
     };
 
@@ -169,53 +210,54 @@ export default function Dashboard() {
     return () => clearInterval(intervalId);
   }, []);
 
-  const handleLockAction = async (action: 'lock' | 'unlock') => {
-    try {
-      await fetch(`${API_BASE}/api/v1/devices/${DEVICE_ID}/actions/${action}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: action === 'unlock' ? JSON.stringify({ durationMs: 5000 }) : undefined
-      });
-      setIsLocked(action === 'lock');
-    } catch (error) {
-      console.error(`Failed to ${action}:`, error);
-    }
-  };
-
   const handleMicToggle = async () => {
     try {
       if (!isRecording) {
-        await fetch(`${API_BASE}/api/v1/devices/${DEVICE_ID}/actions/learn/start`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ sessionName: "new-pattern", maxDurationMs: 10000 })
-        });
         setIsRecording(true);
+        setPatternPanelState("RECORD")
       } else {
-        await fetch(`${API_BASE}/api/v1/devices/${DEVICE_ID}/actions/learn/stop`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ saveAsPattern: true, patternName: "new-pattern" })
-        });
         setIsRecording(false);
+        setPatternPanelState("END")
       }
     } catch (error) {
       console.error("Failed to toggle mic state:", error);
     }
   };
 
+  const handlePatternUpload = async () => {
+    setPatternRep(pattern as number[])
+    const payload = {
+      rev: 1,
+      data: { 
+        activation_threshold: Math.round(sensitivity * 1024), 
+        predict_threshold: rmseThreshold,
+        pattern_representation : patternRep,
+        idle_cutoff_period : idleCutoffPeriod
+      }
+    };
+    await fetch(`${API_BASE}/api/v1/devices/${DEVICE_ID}/config`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    alert('Configuration pushed to device.');
+    setPatternPanelState("DEFAULT")
+  }
+
   const handleCancelPattern = async () => {
     try {
-      await fetch(`${API_BASE}/api/v1/devices/${DEVICE_ID}/actions/learn/stop`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ saveAsPattern: false })
-      });
       setIsRecording(false);
+      setIsProcessing(false)
+      setPatternPanelState("DEFAULT")
     } catch (error) {
       console.error("Failed to cancel pattern:", error);
     }
   };
+
+  const storePattern = async (a : any) => {
+    setPattern(a);
+    setIsProcessing(false);
+  }
 
   return (
     <div className={`min-h-screen w-full flex overflow-hidden bg-gradient-to-tr text-white p-6 transition-colors duration-1000 ease-in-out ${
@@ -239,17 +281,22 @@ export default function Dashboard() {
         <div className="bg-neutral-800 p-4 rounded-lg shadow-lg border border-neutral-700">
           <div className="flex justify-between items-center mb-4">
             <h2 className="text-xl font-bold">Device State</h2>
-            <span className={`px-2 py-1 rounded text-xs font-bold ${deviceState?.status === 'online' ? 'bg-green-600' : 'bg-red-600'}`}>
-              {deviceState?.status?.toUpperCase() || 'OFFLINE'}
+            <span className={`px-2 py-1 rounded text-xs font-bold ${deviceState === null ? 'bg-indigo-600' : (deviceState?.status === 'online' ? 'bg-green-600' : 'bg-red-600')} `}>
+              {deviceState === null ? 'CONNECTING' : (
+                deviceState?.status?.toUpperCase() || 'OFFLINE'
+              )}
             </span>
           </div>
-          <div className="flex gap-4 text-sm text-neutral-400 mb-4">
+          {/* <div className="flex gap-4 text-sm text-neutral-400 mb-4">
             <div>Battery: <span className="text-white">{deviceState?.telemetry?.battery || '--'}%</span></div>
             <div>RSSI: <span className="text-white">{deviceState?.telemetry?.rssi || '--'} dBm</span></div>
-          </div>
+          </div> */}
           <div className="flex gap-2">
-            <button onClick={() => handleLockAction('lock')} className="flex-1 bg-red-900 hover:bg-red-800 py-2 rounded font-semibold transition-colors">Lock</button>
-            <button onClick={() => handleLockAction('unlock')} className="flex-1 bg-green-900 hover:bg-green-800 py-2 rounded font-semibold transition-colors">Unlock</button>
+            {(isLocked) ? (
+              <button disabled onClick={() => {}} className="flex-1 bg-red-900 hover:bg-red-800 py-2 rounded font-semibold transition-colors">Current State : Locked</button>
+            ) : (
+              <button disabled onClick={() => {}} className="flex-1 bg-green-900 hover:bg-green-800 py-2 rounded font-semibold transition-colors">Current State : Unlocked</button>
+            )}
           </div>
         </div>
 
@@ -354,24 +401,39 @@ export default function Dashboard() {
           <h3 className="text-sm text-neutral-400">Live line chart of the recorded knocking pattern</h3>
           
           <div className="h-48 w-full border border-neutral-600 border-dashed rounded bg-neutral-900 overflow-hidden">
-            <RecordedPatternChart isRecording={isRecording} />
+            <RecordedPatternChart isRecording={isRecording} callback={storePattern} />
           </div>
 
           <div className="flex justify-between items-center mt-2">
             <div className="text-xs text-neutral-400">
-              {isRecording && <span className="text-red-400 animate-pulse">● Recording active...</span>}
+              {patternPanelState == "RECORD" && <span className="text-red-400 animate-pulse">● Recording active...</span>}
             </div>
             <div className="flex gap-4">
-              {isRecording && (
-                <button onClick={handleCancelPattern} className="bg-neutral-600 hover:bg-neutral-500 px-4 py-2 rounded font-semibold transition-colors text-sm">
-                  Cancel
+              {patternPanelState == "END" && (
+                <>
+                  {isProcessing ? (
+                    <p>Loading...</p>
+                  ) : (
+                    <>
+                      <button onClick={handleCancelPattern} className="bg-neutral-600 hover:bg-neutral-500 px-4 py-2 rounded font-semibold transition-colors text-sm">
+                        Cancel
+                      </button>
+                      <button onClick={handlePatternUpload} className={`rounded-full w-16 h-16 flex items-center justify-center font-bold text-lg shadow-lg transition-all transform hover:scale-105 ${
+                        'bg-blue-600 hover:bg-blue-500'
+                        }`}>
+                        Upload
+                      </button>
+                    </>
+                  )}
+                </>
+              )}
+              {["DEFAULT","RECORD"].includes(patternPanelState) && (
+                <button onClick={handleMicToggle} className={`rounded-full w-16 h-16 flex items-center justify-center font-bold text-lg shadow-lg transition-all transform hover:scale-105 ${
+                    isRecording ? 'bg-red-600 animate-pulse ring-4 ring-red-900' : 'bg-blue-600 hover:bg-blue-500'
+                  }`}>
+                  {isRecording ? 'END' : 'MIC'}
                 </button>
               )}
-              <button onClick={handleMicToggle} className={`rounded-full w-16 h-16 flex items-center justify-center font-bold text-lg shadow-lg transition-all transform hover:scale-105 ${
-                  isRecording ? 'bg-red-600 animate-pulse ring-4 ring-red-900' : 'bg-blue-600 hover:bg-blue-500'
-                }`}>
-                {isRecording ? 'END' : 'MIC'}
-              </button>
             </div>
           </div>
         </div>
